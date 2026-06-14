@@ -1,0 +1,14 @@
+streamlit
+python-dotenv
+python-docx
+pymupdf
+python-pptx
+graphviz
+imageio
+imageio-ffmpeg
+moviepy
+edge-tts
+faster-whisper
+openai
+pydantic
+pytest

@@ -1,0 +1,15 @@
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.streamlit/
+.vs/
+.vscode/
+.venv/
+venv/
+*.log
+uploads/*
+!uploads/.gitkeep
+output/*
+!output/.gitkeep
+deliverables/
