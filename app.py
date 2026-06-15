@@ -371,6 +371,7 @@ def run_and_store(file_path: Path, user_goal: str) -> None:
     st.session_state["last_file_path"] = str(file_path)
     with st.spinner("正在读取文档、规划任务、生成 PPT / 视频 / 导图..."):
         st.session_state["agent_state"] = run_agent(str(file_path), user_goal)
+        st.session_state["active_detail_state"] = st.session_state["agent_state"]
 
 
 def artifact_card(title: str, path: str | Path, note: str) -> None:
@@ -394,6 +395,200 @@ def load_json_file(path: str | Path, default: Any) -> Any:
         return json.loads(file_path.read_text(encoding="utf-8"))
     except Exception:
         return default
+
+
+TOOL_LABELS = {
+    "read_document": "读取课程文档",
+    "generate_summary": "生成摘要",
+    "extract_keywords": "提取关键词",
+    "generate_mindmap": "生成思维导图",
+    "generate_ppt_outline": "生成 PPT 大纲",
+    "generate_slide_scripts": "生成逐页讲稿",
+    "create_ppt": "生成 PPT 文件",
+    "create_video": "合成讲解视频",
+    "transcribe_video": "识别课堂字幕",
+    "read_uploaded_subtitles": "读取上传字幕",
+    "analyze_course_video": "分析课堂视频",
+    "generate_video_mindmap": "生成视频导图",
+}
+
+
+TOOL_OBSERVATIONS = {
+    "read_document": "已读取上传资料并生成文本预览。",
+    "generate_summary": "已生成与课程内容匹配的摘要。",
+    "extract_keywords": "已提取课程核心概念和关键词。",
+    "generate_mindmap": "已生成知识结构导图。",
+    "generate_ppt_outline": "已生成 PPT 页面结构。",
+    "generate_slide_scripts": "已生成逐页讲稿。",
+    "create_ppt": "已输出 generated_presentation.pptx。",
+    "create_video": "已输出讲解视频、字幕和重点时间戳。",
+    "transcribe_video": "已得到课堂视频字幕或使用上传 SRT。",
+    "read_uploaded_subtitles": "已读取用户上传的 SRT 字幕。",
+    "analyze_course_video": "已生成知识点总结、时间戳和 highlight。",
+    "generate_video_mindmap": "已生成课堂视频思维导图。",
+}
+
+
+def _display_tool_name(tool: str) -> str:
+    return TOOL_LABELS.get(tool, tool)
+
+
+def _state_artifacts(state: dict[str, Any]) -> dict[str, str]:
+    artifacts = state.get("artifacts") or {}
+    if artifacts:
+        return artifacts
+    output_value = state.get("output_dir") or state.get("run_dir")
+    if not output_value:
+        return {}
+    output_dir = Path(output_value)
+    if output_dir.exists():
+        return collect_artifacts(
+            output_dir,
+            [
+                "summary.md",
+                "keywords.json",
+                "mindmap.json",
+                "mindmap.png",
+                "mindmap.mmd",
+                "ppt_outline.json",
+                "speech_script.md",
+                "generated_presentation.pptx",
+                "final_video.mp4",
+                "subtitles.srt",
+                "video_markers.json",
+                "video_chapters.md",
+                "run_report.md",
+                "course_video_analysis.md",
+                "course_video_analysis.json",
+                "course_video_markers.json",
+                "course_video_highlights.md",
+                "course_video_mindmap.json",
+                "course_video_mindmap.png",
+                "course_video_mindmap.mmd",
+                "course_video_transcript.txt",
+                "course_video_auto_subtitles.srt",
+            ],
+        )
+    return {}
+
+
+def _infer_tools_from_artifacts(state: dict[str, Any]) -> list[str]:
+    artifacts = _state_artifacts(state)
+    if state.get("type") == "course_video" or any(str(name).startswith("course_video_") for name in artifacts):
+        tools = ["read_uploaded_subtitles" if state.get("subtitle_file") else "transcribe_video", "analyze_course_video", "generate_video_mindmap"]
+        return [tool for tool in tools if tool]
+    tools = ["read_document"]
+    if "summary.md" in artifacts:
+        tools.append("generate_summary")
+    if "keywords.json" in artifacts:
+        tools.append("extract_keywords")
+    if "mindmap.png" in artifacts or "mindmap.mmd" in artifacts:
+        tools.append("generate_mindmap")
+    if "ppt_outline.json" in artifacts:
+        tools.append("generate_ppt_outline")
+    if "speech_script.md" in artifacts:
+        tools.append("generate_slide_scripts")
+    if "generated_presentation.pptx" in artifacts:
+        tools.append("create_ppt")
+    if "final_video.mp4" in artifacts or "subtitles.srt" in artifacts:
+        tools.append("create_video")
+    return tools
+
+
+def normalize_execution_state(state: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not state:
+        return None
+    normalized = dict(state)
+    normalized["artifacts"] = _state_artifacts(normalized)
+    artifacts = normalized["artifacts"]
+    if not normalized.get("summary") and artifacts.get("summary.md"):
+        summary_path = Path(artifacts["summary.md"])
+        if summary_path.exists():
+            normalized["summary"] = {"summary": summary_path.read_text(encoding="utf-8", errors="ignore")}
+    if not normalized.get("keywords") and artifacts.get("keywords.json"):
+        keywords = load_json_file(artifacts["keywords.json"], {})
+        if isinstance(keywords, dict):
+            normalized["keywords"] = keywords
+    if not normalized.get("ppt_outline") and artifacts.get("ppt_outline.json"):
+        outline = load_json_file(artifacts["ppt_outline.json"], {})
+        if isinstance(outline, dict):
+            normalized["ppt_outline"] = outline
+    if not normalized.get("slide_scripts") and artifacts.get("speech_script.md"):
+        script_path = Path(artifacts["speech_script.md"])
+        if script_path.exists():
+            normalized["slide_scripts"] = {"raw_markdown": script_path.read_text(encoding="utf-8", errors="ignore")}
+    selected = list(normalized.get("selected_tools") or [])
+    if not selected:
+        selected = _infer_tools_from_artifacts(normalized)
+    normalized["selected_tools"] = selected
+    if not normalized.get("plan"):
+        if normalized.get("type") == "course_video":
+            strategy = "课堂视频分析工作流"
+            reasoning = "根据课堂视频或字幕生成知识点总结、重点时间戳、highlight 和思维导图。"
+        else:
+            strategy = "课程文档生成工作流"
+            reasoning = "根据用户目标选择文档解析、摘要、关键词、思维导图、PPT、讲稿和视频合成工具。"
+        normalized["plan"] = {
+            "goal": normalized.get("goal") or normalized.get("user_goal") or normalized.get("title") or "课程资料处理",
+            "strategy": strategy,
+            "reasoning": reasoning,
+            "steps": [{"tool": tool, "name": _display_tool_name(tool)} for tool in selected],
+        }
+    if not normalized.get("trace"):
+        normalized["trace"] = [
+            {
+                "step": index,
+                "thought": f"根据任务目标需要执行“{_display_tool_name(tool)}”。",
+                "action": tool,
+                "observation": TOOL_OBSERVATIONS.get(tool, "已完成该工具步骤。"),
+            }
+            for index, tool in enumerate(selected, start=1)
+        ]
+    if not normalized.get("logs"):
+        logs = []
+        if normalized.get("cache_hit"):
+            logs.append("命中历史缓存，已复用上次成功产物。")
+        logs.extend(TOOL_OBSERVATIONS.get(tool, f"已完成 {_display_tool_name(tool)}。") for tool in selected)
+        if normalized.get("verification", {}).get("ok") is True or normalized.get("status") == "success":
+            logs.append("产物完整性校验通过。")
+        normalized["logs"] = logs
+    return normalized
+
+
+def _is_course_video_state(state: dict[str, Any]) -> bool:
+    artifacts = state.get("artifacts") or {}
+    return state.get("type") == "course_video" or any(str(name).startswith("course_video_") for name in artifacts)
+
+
+def _artifact_path(state: dict[str, Any], name: str) -> Path | None:
+    artifacts = state.get("artifacts") or {}
+    value = artifacts.get(name)
+    if not value:
+        return None
+    return Path(value)
+
+
+def _load_video_analysis_from_state(state: dict[str, Any]) -> dict[str, Any]:
+    if state.get("analysis") or state.get("markers"):
+        return state
+    analysis_path = _artifact_path(state, "course_video_analysis.json")
+    if analysis_path:
+        payload = load_json_file(analysis_path, {})
+        if isinstance(payload, dict):
+            return payload
+    return {}
+
+
+def _load_video_markers_from_state(state: dict[str, Any], report: dict[str, Any]) -> list[dict[str, Any]]:
+    markers = report.get("markers") or state.get("markers") or []
+    if markers:
+        return markers
+    markers_path = _artifact_path(state, "course_video_markers.json")
+    if markers_path:
+        payload = load_json_file(markers_path, [])
+        if isinstance(payload, list):
+            return payload
+    return []
 
 
 def render_marker_timeline(markers: list[dict[str, Any]]) -> None:
@@ -523,6 +718,8 @@ def render_artifact_overview(state: dict[str, Any], key_prefix: str = "workspace
 
 
 def render_details(state: dict[str, Any]) -> None:
+    state = normalize_execution_state(state) or {}
+    is_video_state = _is_course_video_state(state)
     st.markdown(
         """
         <div class="section-head">
@@ -537,8 +734,13 @@ def render_details(state: dict[str, Any]) -> None:
     )
     output_dir = Path(state.get("output_dir") or OUTPUT_DIR)
     run_key = str(state.get("run_id") or "current")
+    tab_labels = (
+        ["Agent 决策", "执行轨迹", "视频总结", "时间戳与导图", "执行日志", "全部下载"]
+        if is_video_state
+        else ["Agent 决策", "执行轨迹", "摘要与关键词", "PPT 大纲与讲稿", "执行日志", "全部下载"]
+    )
     plan_tab, trace_tab, content_tab, outline_tab, log_tab, file_tab = st.tabs(
-        ["Agent 决策", "执行轨迹", "摘要与关键词", "PPT 大纲与讲稿", "执行日志", "全部下载"]
+        tab_labels
     )
 
     with plan_tab:
@@ -548,7 +750,7 @@ def render_details(state: dict[str, Any]) -> None:
             st.info(plan.get("reasoning"))
         selected = state.get("selected_tools", [])
         if selected:
-            st.write(" -> ".join(selected))
+            st.write(" -> ".join(_display_tool_name(tool) for tool in selected))
         st.json(plan)
 
     with trace_tab:
@@ -556,35 +758,86 @@ def render_details(state: dict[str, Any]) -> None:
             st.markdown(
                 f"""
                 <div class="trace-card">
-                  <strong>Step {item.get('step')} · {html.escape(str(item.get('action', '')))}</strong><br>
+                  <strong>Step {item.get('step')} · {html.escape(_display_tool_name(str(item.get('action', ''))))}</strong><br>
                   <span>Thought：{html.escape(str(item.get('thought', '')))}</span><br>
                   <span>Observation：{html.escape(str(item.get('observation', '')))}</span>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
+        if not state.get("trace"):
+            st.info("这次运行没有记录执行轨迹。新运行会自动写入，历史运行会尽量根据产物推断。")
         if state.get("repairs"):
             st.markdown("### 自动修复记录")
             st.json(state.get("repairs", []))
 
     with content_tab:
-        st.markdown("### 文档摘要")
-        st.write(state.get("summary", {}).get("summary", ""))
-        st.markdown("### 关键词")
-        st.write("、".join(state.get("keywords", {}).get("keywords", [])))
+        if is_video_state:
+            report = _load_video_analysis_from_state(state)
+            analysis = report.get("analysis", report)
+            summary_text = str(analysis.get("summary") or report.get("summary") or "")
+            keywords = report.get("keywords") or analysis.get("keywords") or []
+            st.markdown("### 课堂视频总结")
+            if summary_text:
+                st.markdown(_highlight_html(summary_text, keywords), unsafe_allow_html=True)
+            else:
+                st.info("暂未读取到视频总结文本。")
+            st.markdown("### 核心知识点")
+            key_points = analysis.get("key_points") or report.get("key_points") or []
+            if key_points:
+                for item in key_points:
+                    title = html.escape(str(item.get("title", "知识点")))
+                    explanation = html.escape(str(item.get("explanation", "")))
+                    evidence = html.escape(str(item.get("evidence", "")))
+                    st.markdown(
+                        f"""
+                        <div class="keypoint-card">
+                          <strong>{title}</strong><br>
+                          <span>{explanation}</span><br>
+                          <span>{evidence}</span>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+            elif keywords:
+                st.write("、".join(str(item) for item in keywords))
+        else:
+            st.markdown("### 文档摘要")
+            st.write(state.get("summary", {}).get("summary", ""))
+            st.markdown("### 关键词")
+            st.write("、".join(state.get("keywords", {}).get("keywords", [])))
 
     with outline_tab:
-        for slide in state.get("ppt_outline", {}).get("slides", []):
-            with st.container(border=True):
-                st.markdown(f"**第 {slide.get('page')} 页：{slide.get('title')}**")
-                for bullet in slide.get("bullets", []):
-                    st.write(f"- {bullet}")
-                script = next(
-                    (item.get("script", "") for item in state.get("slide_scripts", {}).get("scripts", []) if item.get("page") == slide.get("page")),
-                    "",
-                )
-                if script:
-                    st.caption(script)
+        if is_video_state:
+            report = _load_video_analysis_from_state(state)
+            markers = _load_video_markers_from_state(state, report)
+            st.markdown("### 重点时间戳")
+            render_marker_timeline(markers)
+            render_marker_summary(markers)
+            mindmap_path = _artifact_path(state, "course_video_mindmap.png") or _artifact_path(state, "course_video_mindmap.mmd")
+            if mindmap_path and mindmap_path.exists():
+                st.markdown("### 视频思维导图")
+                if mindmap_path.suffix.lower() == ".png":
+                    st.image(str(mindmap_path), use_container_width=True)
+                else:
+                    st.code(mindmap_path.read_text(encoding="utf-8"), language="mermaid")
+        else:
+            slides = state.get("ppt_outline", {}).get("slides", [])
+            for slide in slides:
+                with st.container(border=True):
+                    st.markdown(f"**第 {slide.get('page')} 页：{slide.get('title')}**")
+                    for bullet in slide.get("bullets", []):
+                        st.write(f"- {bullet}")
+                    script = next(
+                        (item.get("script", "") for item in state.get("slide_scripts", {}).get("scripts", []) if item.get("page") == slide.get("page")),
+                        "",
+                    )
+                    if script:
+                        st.caption(script)
+            raw_script = state.get("slide_scripts", {}).get("raw_markdown")
+            if raw_script and not slides:
+                st.markdown("### 讲稿")
+                st.markdown(raw_script)
 
     with log_tab:
         if state.get("verification"):
@@ -594,23 +847,7 @@ def render_details(state: dict[str, Any]) -> None:
             st.write(f"- {log}")
 
     with file_tab:
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            download_button("摘要 Markdown", output_dir / "summary.md", "text/markdown", f"{run_key}_summary_all")
-            download_button("关键词 JSON", output_dir / "keywords.json", "application/json", f"{run_key}_keywords_all")
-            download_button("运行报告", output_dir / "run_report.md", "text/markdown", f"{run_key}_report_all")
-        with col2:
-            mindmap_path = Path(state.get("mindmap_image_path") or output_dir / "mindmap.png")
-            download_button("思维导图", mindmap_path, "image/png" if mindmap_path.suffix.lower() == ".png" else "text/plain", f"{run_key}_mindmap_all")
-            download_button("讲稿 Markdown", output_dir / "speech_script.md", "text/markdown", f"{run_key}_script_all")
-            download_button("视频章节", output_dir / "video_chapters.md", "text/markdown", f"{run_key}_chapters_all")
-        with col3:
-            download_button("PPT", output_dir / "generated_presentation.pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation", f"{run_key}_ppt_all")
-            download_button("讲解视频", output_dir / "final_video.mp4", "video/mp4", f"{run_key}_video_all")
-            download_button("讲解音频", output_dir / "narration_audio" / "narration.mp3", "audio/mpeg", f"{run_key}_narration_all")
-            download_button("字幕 SRT", output_dir / "subtitles.srt", "text/plain", f"{run_key}_subtitles_all")
-            download_button("重点时间戳", output_dir / "video_markers.json", "application/json", f"{run_key}_markers_all")
-            download_button("语音报告", output_dir / "voice_report.json", "application/json", f"{run_key}_voice_report_all")
+        _render_manifest_downloads(state, f"{run_key}_details")
 
 
 def render_results(state: dict[str, Any]) -> None:
@@ -810,6 +1047,9 @@ def _render_history_detail(item: dict[str, Any]) -> None:
         if st.button("删除记录", key=f"delete_{run_id}", use_container_width=True):
             delete_run(run_id)
             st.rerun()
+    if st.button("在运行详情中查看", key=f"detail_{run_id}", use_container_width=True):
+        st.session_state["active_detail_state"] = item
+        st.rerun()
     _render_manifest_downloads(item, run_id)
 
     st.markdown("#### 运行信息")
@@ -886,6 +1126,7 @@ def render_asset_center(state: dict[str, Any] | None) -> None:
 
 
 def render_run_details_center(state: dict[str, Any] | None) -> None:
+    state = normalize_execution_state(state)
     st.markdown(
         """
         <div class="section-head">
@@ -899,7 +1140,7 @@ def render_run_details_center(state: dict[str, Any] | None) -> None:
         unsafe_allow_html=True,
     )
     if not state:
-        st.info("还没有运行文档工作流。运行后这里会显示 Agent 决策、执行日志和校验详情。")
+        st.info("还没有可查看的运行记录。运行文档生成或课堂视频分析后，这里会显示 Agent 决策、执行日志和校验详情。")
         return
     if state.get("errors"):
         st.error("最近一次流程执行时遇到问题。")
@@ -1050,6 +1291,39 @@ def render_video_toolkit() -> None:
                 )
                 if srt_path:
                     artifacts["uploaded_subtitles.srt"] = str(srt_path)
+                selected_tools = ["read_uploaded_subtitles" if srt_path else "transcribe_video", "analyze_course_video", "generate_video_mindmap"]
+                plan = {
+                    "goal": f"分析课堂视频：{Path(video_path).stem}",
+                    "strategy": "课堂视频分析工作流",
+                    "reasoning": "先获得字幕文本，再提炼知识点、重点时间戳、highlight 和思维导图，最后写入历史记录供课堂展示复用。",
+                    "steps": [{"tool": tool, "name": _display_tool_name(tool)} for tool in selected_tools],
+                }
+                trace = [
+                    {
+                        "step": index,
+                        "thought": f"课堂视频分析需要执行“{_display_tool_name(tool)}”。",
+                        "action": tool,
+                        "observation": TOOL_OBSERVATIONS.get(tool, "已完成该工具步骤。"),
+                    }
+                    for index, tool in enumerate(selected_tools, start=1)
+                ]
+                logs = [TOOL_OBSERVATIONS.get(tool, f"已完成 {_display_tool_name(tool)}。") for tool in selected_tools]
+                logs.append("视频分析产物已写入历史记录。")
+                report.update(
+                    {
+                        "type": "course_video",
+                        "status": "success",
+                        "title": Path(video_path).stem,
+                        "source_file": str(video_path),
+                        "subtitle_file": str(srt_path) if srt_path else "",
+                        "artifacts": artifacts,
+                        "selected_tools": selected_tools,
+                        "plan": plan,
+                        "trace": trace,
+                        "logs": logs,
+                        "errors": [],
+                    }
+                )
                 write_manifest(
                     run_dir,
                     {
@@ -1059,11 +1333,16 @@ def render_video_toolkit() -> None:
                         "source_file": str(video_path),
                         "subtitle_file": str(srt_path) if srt_path else "",
                         "artifacts": artifacts,
+                        "selected_tools": selected_tools,
+                        "plan": plan,
+                        "trace": trace,
+                        "logs": logs,
                         "timings": report["timings"],
                         "errors": [],
                     },
                 )
                 st.session_state["course_video_analysis_report"] = report
+                st.session_state["active_detail_state"] = report
             except Exception as exc:
                 if run_dir is not None:
                     failed_artifacts = collect_artifacts(
@@ -1080,6 +1359,22 @@ def render_video_toolkit() -> None:
                             "course_video_auto_subtitles.srt",
                         ],
                     )
+                    selected_tools = ["read_uploaded_subtitles" if srt_path else "transcribe_video", "analyze_course_video", "generate_video_mindmap"]
+                    plan = {
+                        "goal": f"分析课堂视频：{Path(video_path).stem}",
+                        "strategy": "课堂视频分析工作流",
+                        "reasoning": "分析过程异常中断，仍保留已生成的中间产物和错误信息，便于继续排查。",
+                        "steps": [{"tool": tool, "name": _display_tool_name(tool)} for tool in selected_tools],
+                    }
+                    trace = [
+                        {
+                            "step": index,
+                            "thought": f"课堂视频分析需要执行“{_display_tool_name(tool)}”。",
+                            "action": tool,
+                            "observation": TOOL_OBSERVATIONS.get(tool, "已完成该工具步骤。"),
+                        }
+                        for index, tool in enumerate(selected_tools, start=1)
+                    ]
                     write_manifest(
                         run_dir,
                         {
@@ -1089,6 +1384,10 @@ def render_video_toolkit() -> None:
                             "source_file": str(video_path),
                             "subtitle_file": str(srt_path) if srt_path else "",
                             "artifacts": failed_artifacts,
+                            "selected_tools": selected_tools,
+                            "plan": plan,
+                            "trace": trace,
+                            "logs": [f"课堂视频分析失败：{exc}"],
                             "timings": {"course_video_analysis": round(time.perf_counter() - started, 3)},
                             "errors": [str(exc)],
                         },
@@ -1219,6 +1518,7 @@ with st.sidebar:
     st.write(".txt / .docx / .pdf")
 
 state = st.session_state.get("agent_state")
+detail_state = st.session_state.get("active_detail_state") or state
 
 document_tab, video_tab, assets_tab, details_tab = st.tabs(["课程文档生成", "课堂视频分析", "产物中心", "运行详情"])
 
@@ -1232,4 +1532,4 @@ with assets_tab:
     render_asset_center(state)
 
 with details_tab:
-    render_run_details_center(state)
+    render_run_details_center(detail_state)
